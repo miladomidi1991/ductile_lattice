@@ -8,6 +8,7 @@ Kagome lattice builder with PRE-MESH cell-wall removal
 Note: Python 2.7-compatible (no f-strings)
 """
 
+from pdb import run
 from abaqus import *
 from abaqusConstants import *
 import job, mesh, part, regionToolset, sketch
@@ -20,11 +21,11 @@ L = 1.00                       # Bar length [mm]
 elem_N = 5
 el_size = L/elem_N             # Mesh element size [mm]
 Bi = 1.0                       # Beam width 'a' [mm]
-p = 0.05                       # Relative density
+ru = 0.05                       # Relative density
 
 Vy = 10.0                      # Loading velocity [mm/s]
 
-Nx = 8                        # Hexagons in X
+Nx = 6                        # Hexagons in X
 Ny = int(round(11.0 / math.sqrt(3.0) * Nx)/2.00)  # Hexagons in Y
 
 failure_strain = 0.0015
@@ -35,13 +36,14 @@ material_type = 'Brittle'      # 'Brittle' or 'Ductile'
 
 # Removal settings (applied to walls at the GEOMETRY stage)
 removal_fraction = 0.05        # Fraction of wire edges (length ≈ L) to remove
-p = p * (1+removal_fraction)    # Adjusted density for removal
-t = p * L / math.sqrt(3.0)     # Beam thickness 'b' [mm]
+ru = ru * (1+removal_fraction)    # Adjusted density for removal
+t = ru * L / math.sqrt(3.0)     # Beam thickness 'b' [mm]
 wall_len_tol = 0.15            # Relative tolerance on length to classify walls
 
 # Multi-section assignment controls
-N_SECTIONS = 20                # Number of distinct thickness sections (adjustable)
+N_SECTIONS = 10                # Number of distinct thickness sections (adjustable)
 thickness_var_pct = 0.10       # A in (t ± A*t)
+DISLOC_FRACTION = 1.0          # Fraction of junction vertices to dislocate (0..1), spatially spread
 
 # Derived spacing for flat-topped hex tiling
 dx = 2.0 * L
@@ -171,6 +173,14 @@ def edge_length(edge_obj):
         dz = p2[2] - p1[2]
         return math.sqrt(dx*dx + dy*dy + dz*dz)
 
+def edge_midpoint(edge_obj):
+    vtx = edge_obj.getVertices()
+    if len(vtx) != 2:
+        return (0.0, 0.0)
+    p1 = _vertex_point(vtx[0])
+    p2 = _vertex_point(vtx[1])
+    return ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+
 # Classify wall edges by length ~ L (use integer indices instead of Edge objects)
 candidate_edge_idx = []
 for _idx, _e in enumerate(PartMerged.edges):
@@ -179,9 +189,27 @@ for _idx, _e in enumerate(PartMerged.edges):
         candidate_edge_idx.append(_idx)
 
 total_walls = len(candidate_edge_idx)
-num_remove = int(total_walls * removal_fraction)
-edges_to_remove_idx = set(random.sample(candidate_edge_idx, num_remove)) if num_remove > 0 else set()
-print('Pre-mesh walls: %d; scheduled removals: %d' % (total_walls, len(edges_to_remove_idx)))
+# Spatially spread removal: bucket by x-position and sample per bucket
+edges_to_remove_idx = set()
+if total_walls > 0 and removal_fraction > 0.0:
+    # Determine lattice width from Nx, L
+    W_x = 2.0 * Nx * L
+    N_BUCKETS = max(5, min(50, int(Nx)))
+    buckets = [[] for _ in range(N_BUCKETS)]
+    for ei in candidate_edge_idx:
+        eobj = PartMerged.edges[ei]
+        mx, my = edge_midpoint(eobj)
+        b = int(max(0, min(N_BUCKETS - 1, (mx / max(1e-12, W_x)) * N_BUCKETS)))
+        buckets[b].append(ei)
+    for bucket in buckets:
+        if not bucket:
+            continue
+        k = int(len(bucket) * removal_fraction)
+        if k <= 0 and removal_fraction > 0.0 and len(bucket) > 0:
+            k = 1
+        if k > 0:
+            edges_to_remove_idx.update(random.sample(bucket, min(k, len(bucket))))
+print('Pre-mesh walls: %d; scheduled removals: %d (spatially spread)' % (total_walls, len(edges_to_remove_idx)))
 
 # Pre-mesh nodal dislocation at junctions (degree >= 3) on wire geometry
 pre_dislocated_count = 0
@@ -207,10 +235,33 @@ if max_r > 0.0:
         th = random.uniform(0.0, 2.0*math.pi)
         r  = random.uniform(0.0, dx_max)
         return (r*math.cos(th), r*math.sin(th))
+    # Spatially spread selection of junctions based on DISLOC_FRACTION
+    junction_pts = []
     for k, d in vdeg.items():
         if d >= 3:
-            rx, ry = _rand_rad(max_r)
-            disloc_map[k] = (k[0] + rx, k[1] + ry)
+            junction_pts.append(k)
+    selected = []
+    if DISLOC_FRACTION >= 1.0:
+        selected = junction_pts
+    else:
+        # Bucket by x, sample per bucket
+        W_x = 2.0 * Nx * L
+        N_BUCKETS = max(5, min(50, int(Nx)))
+        buckets = [[] for _ in range(N_BUCKETS)]
+        for (xk, yk) in junction_pts:
+            b = int(max(0, min(N_BUCKETS - 1, (xk / max(1e-12, W_x)) * N_BUCKETS)))
+            buckets[b].append((xk, yk))
+        for bucket in buckets:
+            if not bucket:
+                continue
+            k = int(len(bucket) * DISLOC_FRACTION)
+            if k <= 0 and len(bucket) > 0 and DISLOC_FRACTION > 0.0:
+                k = 1
+            if k > 0:
+                selected.extend(random.sample(bucket, min(k, len(bucket))))
+    for (xk, yk) in selected:
+        rx, ry = _rand_rad(max_r)
+        disloc_map[(xk, yk)] = (xk + rx, yk + ry)
     pre_dislocated_count = len(disloc_map)
     if pre_dislocated_count > 0:
         print('Pre-mesh junction dislocation applied at %d vertices (max_r=%.4f).' % (pre_dislocated_count, max_r))
@@ -244,6 +295,92 @@ except Exception:
 
 # Adopt filtered Part for downstream steps
 Part = FilteredPart
+
+
+# Create N geometry sets Set-1..Set-N with spatially spread bars (randomized, non-overlapping)
+p = Part
+X = len(p.edges)
+if X == 0 or N_SECTIONS <= 0:
+    print('Skip Set_i partition: X=%d, N=%d' % (X, N_SECTIONS))
+else:
+    # Clean existing Set-# only (avoid touching user sets)
+    try:
+        for i_del in range(1, N_SECTIONS + 1):
+            nm = 'Set-%d' % i_del
+            if nm in p.sets.keys():
+                del p.sets[nm]
+    except Exception:
+        pass
+
+    # Shuffle edge indices to distribute selection across the lattice
+    all_idx = list(range(X))
+    random.shuffle(all_idx)
+
+    # Round-robin indices into N buckets to ensure each set samples the whole domain
+    buckets = [[] for _ in range(N_SECTIONS)]
+    for pos, idx in enumerate(all_idx):
+        buckets[pos % N_SECTIONS].append(idx)
+
+    # For each bucket, coalesce consecutive indices into contiguous runs and create subsets
+    for i in range(N_SECTIONS):
+        set_name = 'Set-%d' % (i + 1)
+        try:
+            if set_name in p.sets.keys():
+                del p.sets[set_name]
+        except Exception:
+            pass
+
+        idxs = sorted(buckets[i])
+        if not idxs:
+            # Create an empty geometry set to keep numbering stable
+            p.Set(name=set_name, edges=())
+            continue
+
+        # Find contiguous runs
+        runs = []
+        run_start = idxs[0]
+        prev = idxs[0]
+        for k in idxs[1:]:
+            if k == prev + 1:
+                prev = k
+                continue
+            runs.append((run_start, prev))
+            run_start = k
+            prev = k
+        runs.append((run_start, prev))
+
+        # Create temporary subset sets for each run, then union into Set-i
+        subset_names = []
+        for rj, (a, b) in enumerate(runs):
+            # EdgeArray slicing is end-exclusive, so slice [a:b+1]
+            edge_slice = p.edges[a:b+1]
+            sub_name = '%s_sub_%d' % (set_name, rj)
+            try:
+                if sub_name in p.sets.keys():
+                    del p.sets[sub_name]
+            except Exception:
+                pass
+            try:
+                p.Set(name=sub_name, edges=edge_slice)
+                subset_names.append(sub_name)
+            except Exception:
+                pass
+
+        # Union subsets into the final Set-i
+        if subset_names:
+            try:
+                p.SetByBoolean(name=set_name, sets=tuple(p.sets[n] for n in subset_names))
+            except Exception:
+                # Fallback: keep first subset as Set-i
+                p.Set(name=set_name, edges=p.sets[subset_names[0]].edges)
+        else:
+            # If no subset could be created, at least make an empty set
+            p.Set(name=set_name, edges=())
+
+    print('Created %d randomized, non-overlapping geometry sets (Set-1..Set-%d), total edges=%d' % (N_SECTIONS, N_SECTIONS, X))
+
+
+
 
 
 # ============================================================
@@ -287,24 +424,20 @@ if N_SECTIONS <= 1:
 else:
     thicknesses = [th_min + i*(th_max - th_min)/(N_SECTIONS - 1) for i in range(N_SECTIONS)]
 
+# Randomly assign wall edges to classes
 random.shuffle(wall_edge_idx)
-X_total = len(wall_edge_idx)
-base = X_total // max(1, N_SECTIONS)
-rem = X_total % max(1, N_SECTIONS)
+per_class = int(math.floor(len(wall_edge_idx) / float(max(1, N_SECTIONS))))
 assignments = []
-cursor = 0
+start = 0
 for i in range(N_SECTIONS):
-    take = base + (1 if i < rem else 0)
-    block = wall_edge_idx[cursor:cursor+take]
-    assignments.append(block)
-    cursor += take
+    end = start + per_class
+    if i == N_SECTIONS - 1:
+        end = len(wall_edge_idx)
+    assignments.append(wall_edge_idx[start:end])
+    start = end
 
 print('Section assignment: total walls=%d, classes=%d, base t=%.5f, range=[%.5f, %.5f]' % (len(wall_edge_idx), N_SECTIONS, t, th_min, th_max))
 
-assigned_any = False
-assigned_counts = {}
-assigned_indices = set()
-created_sets = []
 # Create profiles/sections and assign per class
 for i, edge_ids in enumerate(assignments):
     if not edge_ids:
@@ -330,23 +463,15 @@ for i, edge_ids in enumerate(assignments):
     if not uniq_ids:
         continue
     reg_edges = tuple(Part.edges[k] for k in uniq_ids)
-    set_name = 'WallSet_%d' % i
+    set_name = 'WallClass_%d' % i
     try:
         if set_name in Part.sets.keys():
             del Part.sets[set_name]
     except Exception:
         pass
     try:
-        # Create set first (CAE-style), then assign section using that set
         reg = Part.Set(name=set_name, edges=reg_edges)
-        region_edges = regionToolset.Region(edges=reg_edges)
-        Part.SectionAssignment(region=region_edges, sectionName=sec_name,
-            offset=0.0, offsetType=MIDDLE_SURFACE, offsetField='', thicknessAssignment=FROM_SECTION)
-        assigned_any = True
-        assigned_counts[i] = len(reg_edges)
-        created_sets.append(set_name)
-        for k in uniq_ids:
-            assigned_indices.add(k)
+        Part.SectionAssignment(region=reg, sectionName=sec_name)
     except Exception:
         # Fallback: assign in smaller chunks; if still failing, assign per-edge
         chunk = 500
@@ -361,18 +486,11 @@ for i, edge_ids in enumerate(assignments):
                 try:
                     if sub_name in Part.sets.keys():
                         del Part.sets[sub_name]
-                    Part.Set(name=sub_name, edges=sub_edges)
-                    region_sub = regionToolset.Region(edges=sub_edges)
-                    Part.SectionAssignment(region=region_sub, sectionName=sec_name,
-                        offset=0.0, offsetType=MIDDLE_SURFACE, offsetField='', thicknessAssignment=FROM_SECTION)
-                    created_sets.append(sub_name)
                 except Exception:
                     pass
-            assigned_any = True
-            assigned_counts[i] = len(reg_edges)
+                reg_sub = Part.Set(name=sub_name, edges=sub_edges)
+                Part.SectionAssignment(region=reg_sub, sectionName=sec_name)
             success = True
-            for k in sub_ids:
-                assigned_indices.add(k)
         except Exception:
             success = False
         if not success:
@@ -384,16 +502,10 @@ for i, edge_ids in enumerate(assignments):
                     try:
                         if one_name in Part.sets.keys():
                             del Part.sets[one_name]
-                        Part.Set(name=one_name, edges=(e,))
-                        region_one = regionToolset.Region(edges=(e,))
-                        Part.SectionAssignment(region=region_one, sectionName=sec_name,
-                            offset=0.0, offsetType=MIDDLE_SURFACE, offsetField='', thicknessAssignment=FROM_SECTION)
-                        created_sets.append(one_name)
                     except Exception:
                         pass
-                    assigned_any = True
-                    assigned_counts[i] = assigned_counts.get(i, 0) + 1
-                    assigned_indices.add(eid)
+                    reg_one = Part.Set(name=one_name, edges=(e,))
+                    Part.SectionAssignment(region=reg_one, sectionName=sec_name)
                 except Exception:
                     # Skip problematic edge
                     pass
@@ -405,51 +517,37 @@ Part.assignBeamSectionOrientation(region=regAll, method=N1_COSINES, n1=(0.0,0.0,
 # Print per-class counts and thickness
 for i, edge_ids in enumerate(assignments):
     th_i = thicknesses[min(i, len(thicknesses)-1)]
-    assigned_edges = assigned_counts.get(i, 0)
-    print('Class %d: walls=%d, thickness=%.5f, assigned_edges=%d' % (i, len(edge_ids), th_i, assigned_edges))
+    print('Class %d: walls=%d, thickness=%.5f' % (i, len(edge_ids), th_i))
 
-print('Total section assignments on Part before mesh: %d' % len(Part.sectionAssignments))
-print('Created sets (count=%d): %s' % (len(created_sets), ', '.join(created_sets)))
+# Create N sections and assign each to Set-1..Set-N
+p = Part
+for i in range(N_SECTIONS):
+    set_name = 'Set-%d' % (i + 1)
+    if set_name not in p.sets.keys():
+        continue  # skip empty/missing sets
 
-# Ensure complete coverage: assign any remaining wall edges to the last section
-remaining = [k for k in wall_edge_idx if k not in assigned_indices]
-if remaining:
-    last_i = min(N_SECTIONS - 1, len(thicknesses) - 1)
-    last_sec = 'BeamSection_%d' % last_i
-    rem_edges = tuple(Part.edges[k] for k in remaining)
+    # Make (or reuse) a section profile per class
+    prof_name = 'Rect_%d' % i
+    sec_name  = 'BeamSection_%d' % i
+    bi = Bi
+    bj = (t * (1.0 - thickness_var_pct)) + i * (2.0 * t * thickness_var_pct) / max(1, (N_SECTIONS - 1))
+
     try:
-        region_rem = regionToolset.Region(edges=rem_edges)
-        Part.SectionAssignment(
-            region=region_rem,
-            sectionName=last_sec,
-            offset=0.0,
-            offsetType=MIDDLE_SURFACE,
-            offsetField='',
-            thicknessAssignment=FROM_SECTION
-        )
-        try:
-            if 'WallSet_remaining' in Part.sets.keys():
-                del Part.sets['WallSet_remaining']
-            Part.Set(name='WallSet_remaining', edges=rem_edges)
-            created_sets.append('WallSet_remaining')
-        except Exception:
-            pass
-        print('Assigned remaining %d wall edges to %s' % (len(remaining), last_sec))
+        Model.RectangularProfile(name=prof_name, a=bi, b=bj)
     except Exception:
-        # Fallback per-edge
-        for eid in remaining:
-            try:
-                e = Part.edges[eid]
-                Part.SectionAssignment(
-                    region=regionToolset.Region(edges=(e,)),
-                    sectionName=last_sec,
-                    offset=0.0,
-                    offsetType=MIDDLE_SURFACE,
-                    offsetField='',
-                    thicknessAssignment=FROM_SECTION
-                )
-            except Exception:
-                pass
+        pass
+    try:
+        Model.BeamSection(name=sec_name, integration=DURING_ANALYSIS, profile=prof_name, material='damage')
+    except Exception:
+        pass
+
+    # IMPORTANT: use the set region directly
+    region_i = p.sets[set_name]
+    try:
+        Part.SectionAssignment(region=region_i, sectionName=sec_name,
+            offset=0.0, offsetType=MIDDLE_SURFACE, offsetField='', thicknessAssignment=FROM_SECTION)
+    except Exception:
+        pass
 
 Part.seedPart(size=el_size)
 # Ensure compatibility with downstream variable name
@@ -562,11 +660,11 @@ except Exception:
 # ============================================================
 step_name = 'damage'
 Model.ExplicitDynamicsStep(name=step_name, previous='Initial', timePeriod=Period, improvedDtMethod=ON)
-
 Model.FieldOutputRequest(name='F-Output-1', createStepName=step_name, variables=('RF','U'))
 Model.fieldOutputRequests['F-Output-1'].setValues(numIntervals=nbr_frames)
 Model.FieldOutputRequest(name='F-Output-2', createStepName=step_name, variables=('LE','S','SDEG','STATUS'))
 Model.fieldOutputRequests['F-Output-2'].setValues(numIntervals=nbr_frames)
+
 
 
 # ============================================================
@@ -579,6 +677,8 @@ rp = asm.ReferencePoint(point=((W_x - L)/2.0, W_y - math.sqrt(3.0)*L/2.0, 0.0))
 Ref1 = asm.referencePoints[rp.id]
 asm.Set(referencePoints=(Ref1,), name='Ref1')
 regionRP = asm.sets['Ref1']
+Model.HistoryOutputRequest(name='Ref1', createStepName=step_name, variables=('U2','RF2'), region=regionRP).setValues(numIntervals=nbr_frames)
+
 
 tie_nodes = inst.nodes.getByBoundingBox(
     xMin=-L/2.0, yMin=W_y - math.sqrt(3.0)*L/2.0 - el_size/10.0, zMin=-1.0,
@@ -587,14 +687,14 @@ tie_nodes = inst.nodes.getByBoundingBox(
 tieRegion = regionToolset.Region(nodes=tie_nodes)
 Model.RigidBody(name='Constraint-1', refPointRegion=regionRP, tieRegion=tieRegion)
 
-Model.VelocityBC(name='Up', createStepName=step_name, region=regionRP, v2=Vy)
+Model.VelocityBC(name='Up', createStepName=step_name, region=regionRP, v1=0.0, v2=Vy)
 
 bottom_nodes = inst.nodes.getByBoundingBox(
     xMin=-L/2.0 - el_size,   yMin=-L*math.sqrt(3.0)/2.0 - el_size, zMin=-1.0,
     xMax=W_x + el_size,      yMax=-L*math.sqrt(3.0)/2.0 + el_size, zMax= 1.0
 )
 botRegion = regionToolset.Region(nodes=bottom_nodes)
-Model.DisplacementBC(name='Bottom', createStepName=step_name, region=botRegion, u2=0.0)
+Model.DisplacementBC(name='Bottom', createStepName=step_name, region=botRegion, u1=0.0, u2=0.0)
 
 LR_nodes = inst.nodes.getByBoundingBox(
     xMin=-L, yMin=-L*math.sqrt(3.0)/2.0, zMin=-1.0,
@@ -609,7 +709,7 @@ Model.DisplacementBC(name='Left-and-right', createStepName=step_name, region=LRR
 # ============================================================
 print('Writing job input...')
 print('Lattice size: W = %.3f, H = %.3f' % (W_x, W_y))
-ru_token   = ('%.4f' % p).replace('.', 'p')
+ru_token   = ('%.4f' % ru).replace('.', 'p')
 del_token  = ('%.4f' % removal_fraction).replace('.', 'p')
 dis_token  = ('%.4f' % (max_r / L)).replace('.', 'p')
 sec_token  = '%d' % int(N_SECTIONS)
